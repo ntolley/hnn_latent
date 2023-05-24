@@ -15,10 +15,14 @@ from sbi import analysis as sbi_analysis
 from sbi import inference as sbi_inference
 from sklearn.decomposition import PCA
 import scipy
+from scipy.signal import periodogram, welch
+from sklearn.linear_model import LinearRegression
+from fooof import FOOOF
 
 from hnn_core import jones_2009_model, simulate_dipole, pick_connection
-from hnn_core.cells_default import _linear_g_at_dist, _exp_g_at_dist, pyramidal
 from hnn_core.params import _short_name
+from hnn_core.network import _connection_probability
+
 rng_seed = 123
 rng = np.random.default_rng(rng_seed)
 torch.manual_seed(rng_seed)
@@ -27,7 +31,7 @@ np.random.seed(rng_seed)
 device = 'cpu'
 num_cores = 256
 
-def run_hnn_sim(net, param_function, prior_dict, theta_samples, tstop, save_path, save_suffix):
+def run_hnn_sim(net, param_function, prior_dict, theta_samples, tstop, save_path, save_suffix, theta_extra=dict()):
     """Run parallel HNN simulations using Dask distributed interface
     
     Parameters
@@ -47,11 +51,13 @@ def run_hnn_sim(net, param_function, prior_dict, theta_samples, tstop, save_path
         Location to store simulations. Must have subdirectories 'sbi_sims/' and 'temp/'
     save_suffix: str
         Name appended to end of output files
+    theta_extra: dict
+        Extra information needed for param_function passed through this variable
     """
     
     # create simulator object, rescale function transforms (0,1) to range specified in prior_dict    
     simulator = partial(simulator_hnn, prior_dict=prior_dict, param_function=param_function,
-                        network_model=net, tstop=tstop, return_objects=True)
+                        network_model=net, tstop=tstop, theta_extra=theta_extra, return_objects=True)
     # Generate simulations
     seq_list = list()
     num_sims = theta_samples.shape[0]
@@ -81,8 +87,8 @@ def run_hnn_sim(net, param_function, prior_dict, theta_samples, tstop, save_path
     theta_name = f'{save_path}/sbi_sims/theta_{save_suffix}.npy'
     
     np.save(dpl_name, dpl_orig)
-    np.save(spike_times_name, spike_times_orig)
-    np.save(spike_gids_name, spike_gids_orig)
+    #np.save(spike_times_name, spike_times_orig)
+    #np.save(spike_gids_name, spike_gids_orig)
     np.save(theta_name, theta_orig)
 
     files = glob.glob(str(save_path) + '/temp/*')
@@ -94,15 +100,15 @@ def start_cluster():
      # Set up cluster and reserve resources
     cluster = SLURMCluster(
         cores=32, processes=32, queue='compute', memory="256GB", walltime="5:00:00",
-        job_extra=['-A csd403', '--nodes=1'], log_directory=os.getcwd() + '/slurm_out')
+        job_extra_directives=['-A csd403', '--nodes=1'], log_directory=os.getcwd() + '/slurm_out')
 
     client = Client(cluster)
-    client.upload_file('utils.py')
+    client.upload_file('../utils.py')
     print(client.dashboard_link)
     
     client.cluster.scale(num_cores)
         
-def train_posterior(data_path, ntrain_sims, x_noise_amp, theta_noise_amp, window_samples):
+def train_posterior(data_path, ntrain_sims, x_noise_amp, theta_noise_amp, extra_dict=None):
     """Train sbi posterior distribution"""
     posterior_dict = dict()
     posterior_dict_training_data = dict()
@@ -116,11 +122,12 @@ def train_posterior(data_path, ntrain_sims, x_noise_amp, theta_noise_amp, window
     limits = list(prior_dict.values())
 
     # x_orig stores full waveform to be used for embedding
+    window_samples = extra_dict['window_samples']
     x_orig, theta_orig = np.load(f'{data_path}/sbi_sims/dpl_sbi.npy'), np.load(f'{data_path}/sbi_sims/theta_sbi.npy')
     x_orig, theta_orig = x_orig[:ntrain_sims, window_samples[0]:window_samples[1]], theta_orig[:ntrain_sims, :]
 
-    spike_gids_orig = np.load(f'{data_path}/sbi_sims/spike_gids_sbi.npy', allow_pickle=True)
-    spike_gids_orig = spike_gids_orig[:ntrain_sims]
+    #spike_gids_orig = np.load(f'{data_path}/sbi_sims/spike_gids_sbi.npy', allow_pickle=True)
+    #spike_gids_orig = spike_gids_orig[:ntrain_sims]
 
     # Add noise for regularization
     x_noise = rng.normal(loc=0.0, scale=x_noise_amp, size=x_orig.shape)
@@ -131,55 +138,29 @@ def train_posterior(data_path, ntrain_sims, x_noise_amp, theta_noise_amp, window
 
     dt = sim_metadata['dt'] # Sampling interval used for simulation
     fs = (1/dt) * 1e3
-
-    pca4 = PCA(n_components=4, random_state=rng_seed)
-    pca4.fit(x_orig_noise)
     
-    pca30 = PCA(n_components=30, random_state=rng_seed)
-    pca30.fit(x_orig_noise)
-    
-    spike_rate_func = partial(get_dataset_spike_rates, gid_ranges=sim_metadata['gid_ranges'])
-    
-    pca4_spike_rate_func = partial(get_dataset_pca4_spike_rates, gid_ranges=sim_metadata['gid_ranges'], pca4=pca4)
+    slope_func = partial(get_scalefree_slope, fs=fs)
 
     posterior_metadata = {'rng_seed': rng_seed, 'x_noise_amp': x_noise_amp, 'theta_noise_amp': theta_noise_amp,
-                          'ntrain_sims': ntrain_sims, 'fs': fs, 'window_samples': window_samples}
+                          'ntrain_sims': ntrain_sims, 'fs': fs, 'window_samples': window_samples,
+                          'extra_dict': extra_dict}
     posterior_metadata_save_label = f'{data_path}/posteriors/posterior_metadata.pkl'
     with open(posterior_metadata_save_label, 'wb') as output_file:
             dill.dump(posterior_metadata, output_file)
             
-    raw_data_type = {'dpl': x_orig_noise, 'spike_gids': spike_gids_orig,
-                     'dpl_spike_gids': {'dpl': x_orig_noise, 'spike_gids': spike_gids_orig}}
-
-    input_type_list = {'pca4_spike_rates': {
+    raw_data_type = {'dpl': x_orig_noise,
+                     'aperiodic_fname': extra_dict['aperiodic_fname']
+                     #'spike_gids': spike_gids_orig,
+                     #'dpl_spike_gids': {'dpl': x_orig_noise, 'spike_gids': spike_gids_orig}
+                    }
+    input_type_list = {'aperiodic': {
                            'embedding_func': torch.nn.Identity,
-                           'embedding_dict': dict(), 'feature_func': pca4_spike_rate_func,
-                           'data_type': 'dpl_spike_gids'},
-        
-                        'raw_waveform': {
+                           'embedding_dict': dict(), 'feature_func': np.load,
+                           'data_type': 'aperiodic_fname'},
+                        'bandpower': {
                            'embedding_func': torch.nn.Identity,
-                           'embedding_dict': dict(), 'feature_func': torch.nn.Identity(),
-                           'data_type': 'dpl'},
-        
-                       'pca30': {
-                           'embedding_func': torch.nn.Identity,
-                           'embedding_dict': dict(), 'feature_func': pca30.transform, 
-                           'data_type': 'dpl'},
-                       
-                       'pca4': {
-                           'embedding_func': torch.nn.Identity,
-                           'embedding_dict': dict(), 'feature_func': pca4.transform, 
-                           'data_type': 'dpl'},
-    
-                       'spike_rates': {
-                           'embedding_func': torch.nn.Identity,
-                           'embedding_dict': dict(), 'feature_func': spike_rate_func,
-                           'data_type': 'spike_gids'},
-                       
-                       #'pca4_spike_rates': {
-                       #    'embedding_func': torch.nn.Identity,
-                       #    'embedding_dict': dict(), 'feature_func': pca4_spike_rate_func,
-                       #    'data_type': 'dpl_spike_gids'}
+                           'embedding_dict': dict(), 'feature_func': partial(get_dataset_bandpower, fs=fs),
+                           'data_type': 'dpl'}
                       }
     
 
@@ -196,12 +177,13 @@ def train_posterior(data_path, ntrain_sims, x_noise_amp, theta_noise_amp, window
 
         inference.append_simulations(theta_train, x_train, proposal=prior)
 
-        nn_posterior = inference.train(num_atoms=10, training_batch_size=5000, use_combined_loss=True, discard_prior_samples=True, max_num_epochs=None, show_train_summary=True)
+        print(theta_train.shape, x_train.shape)
+        nn_posterior = inference.train(num_atoms=10, training_batch_size=5000, use_combined_loss=True, discard_prior_samples=True, show_train_summary=True)
 
         posterior_dict[input_type] = {'posterior': nn_posterior.state_dict(),
-                                    'n_params': n_params,
-                                    'n_sims': ntrain_sims,
-                                    'input_dict': input_dict}
+                                      'n_params': n_params,
+                                      'n_sims': ntrain_sims,
+                                      'input_dict': input_dict}
 
         # Save intermediate progress
         posterior_save_label = f'{data_path}/posteriors/posterior_dicts.pkl'
@@ -264,7 +246,7 @@ def validate_posterior(net, nval_sims, param_function, data_path):
                 theta_samples=theta_samples, tstop=tstop, save_path=data_path, save_suffix=save_suffix)
 
 # Create batch simulation function
-def batch(simulator, seq, theta_samples, save_path):
+def batch(simulator, seq, theta_samples, save_path, save_spikes=False):
     print(f'Sim Idx: {(seq[0], seq[-1])}')
     res_list = list()
     # Create lazy list of tasks    
@@ -288,17 +270,25 @@ def batch(simulator, seq, theta_samples, save_path):
         spike_gids_list.append(net_res.cell_response.spike_gids[0])
 
         
+    spike_times_list = np.array(spike_times_list, dtype=object)
+    spike_gids_list = np.array(spike_gids_list, dtype=object)
     
     dpl_name = f'{save_path}/temp/dpl_temp{seq[0]}-{seq[-1]}.npy'
     spike_times_name = f'{save_path}/temp/spike_times_temp{seq[0]}-{seq[-1]}.npy'
     spike_gids_name = f'{save_path}/temp/spike_gids_temp{seq[0]}-{seq[-1]}.npy'
+    
 
     theta_name = f'{save_path}/temp/theta_temp{seq[0]}-{seq[-1]}.npy'
 
     np.save(dpl_name, dpl_list)
-    np.save(spike_times_name, spike_times_list)
-    np.save(spike_gids_name, spike_gids_list)
     np.save(theta_name, theta_samples.detach().cpu().numpy())
+    
+    if save_spikes:
+        np.save(spike_times_name, spike_times_list)
+        np.save(spike_gids_name, spike_gids_list)
+    else:
+        np.save(spike_times_name, list())
+        np.save(spike_gids_name, list())
 
 def linear_scale_forward(value, bounds, constrain_value=True):
     """Scale value in range (0,1) to range bounds"""
@@ -329,6 +319,33 @@ def log_scale_array(value, bounds, constrain_value=True):
     return np.vstack(
         [log_scale_forward(value[:, idx], bounds[idx], constrain_value) for 
          idx in range(len(bounds))]).T
+
+# 1/f slope citation https://www.sciencedirect.com/science/article/pii/S1053811917305621?via=ihub
+def get_scalefree_slope(x, fs, min_freq=30, max_freq=100):    
+    slope_list = list()
+    for idx in range(x.shape[0]):
+        freqs, Pxx = welch(x[idx,:], fs, nperseg=1024, average='median')
+
+        lm = LinearRegression()
+        mask = np.logical_and(freqs > min_freq, freqs < max_freq)
+
+        lm.fit(np.log(freqs[mask].reshape(-1,1)), np.log(Pxx[mask]).reshape(-1,1))
+        slope_list.append(lm.coef_[0][0])
+        
+    return np.array(slope_list).reshape(-1,1)
+
+def get_aperiodic(dpl, fs, min_freq=3, max_freq=80):
+    fm = FOOOF()
+    freqs, Pxx = welch(dpl, fs, nperseg=10_000, average='median', noverlap=5000)
+    
+    freq_range = [min_freq, max_freq]
+    # Define frequency range across which to model the spectrum
+    fm.report(freqs, Pxx, freq_range)
+
+    aperiodic_params = fm.get_results().aperiodic_params
+    offset, exponent = aperiodic_params[0], aperiodic_params[1]
+    
+    return offset, exponent
 
 def bandpower(x, fs, fmin, fmax):
     f, Pxx = scipy.signal.periodogram(x, fs=fs)
@@ -466,14 +483,14 @@ class HNNSimulator:
             If true, returns tuple of (Network, Dipole) objects. If False, a preprocessed time series
             of the aggregate current dipole (Dipole.data['agg']) is returned.
         """
-        self.dt = 0.5  # Used for faster simulations, default.json uses 0.025 ms
+        self.dt = 0.05  # Used for faster simulations, default.json uses 0.025 ms
         self.tstop = tstop  # ms
         self.prior_dict = prior_dict
         self.param_function = param_function
         self.return_objects = return_objects
         self.network_model = network_model
 
-    def __call__(self, theta_dict):
+    def __call__(self, theta_dict, theta_extra=dict()):
         """
         Parameters
         ----------
@@ -486,6 +503,7 @@ class HNNSimulator:
         """        
         assert len(theta_dict) == len(self.prior_dict)
         assert theta_dict.keys() == self.prior_dict.keys()
+        theta_dict['theta_extra'] = theta_extra
 
         # instantiate the network object -- only connectivity params matter
         net = self.network_model.copy()
@@ -506,7 +524,7 @@ class HNNSimulator:
             return x      
 
 def simulator_hnn(theta, prior_dict, param_function, network_model,
-                  tstop, return_objects=False):
+                  tstop, theta_extra=dict(), return_objects=False):
     """Helper function to run simulations with HNN class
 
     Parameters
@@ -524,6 +542,8 @@ def simulator_hnn(theta, prior_dict, param_function, network_model,
         be simulated.
     tstop: int
         Simulation stop time (ms)
+    theta_extra: dict
+        Extra information needed for param_function passed through this variable
     return_objects: bool
         If true, returns tuple of (Network, Dipole) objects. If False, a preprocessed time series
         of the aggregate current dipole (Dipole.data['agg']) is returned.
@@ -540,16 +560,18 @@ def simulator_hnn(theta, prior_dict, param_function, network_model,
     # handle when just one theta
     if theta.ndim == 1:
         return simulator_hnn(theta.view(1, -1), prior_dict, param_function,
-                             return_objects=return_objects, network_model=network_model, tstop=tstop)
+                             return_objects=return_objects, network_model=network_model, tstop=tstop,
+                             theta_extra=theta_extra)
 
     # loop through different values of theta
     x = list()
     for sample_idx, thetai in enumerate(theta):
         theta_dict = {param_name: param_dict['rescale_function'](thetai[param_idx].numpy(), param_dict['bounds']) for 
                       param_idx, (param_name, param_dict) in enumerate(prior_dict.items())}
+        theta_extra['sample_idx'] =  sample_idx
         
         print(theta_dict)
-        xi = hnn(theta_dict)
+        xi = hnn(theta_dict, theta_extra)
         x.append(xi)
 
     # Option to return net and dipole objects or just the 
@@ -630,6 +652,79 @@ def hnn_erp_param_function(net, theta_dict):
         weights_ampa=weights_ampa_p2, location='proximal', n_drive_cells=n_drive_cells,
         cell_specific=cell_specific, synaptic_delays=synaptic_delays_prox, event_seed=4)
     
+    
+def hnn_noise_conn_prob_param_function(net, theta_dict):
+    conn_type_list = {'EI_connections': 'EI_prob', 'EE_connections': 'EE_prob', 
+                      'II_connections': 'II_prob', 'IE_connections': 'IE_prob'}
+    
+    seed_rng = np.random.default_rng(theta_dict['theta_extra']['sample_idx'])
+    seed_array = seed_rng.integers(10e5, size=100)
+
+    
+    seed_count = 0
+    for conn_type_name, conn_prob_name in conn_type_list.items():
+        conn_indices = theta_dict['theta_extra'][conn_type_name]
+        probability = theta_dict[conn_prob_name]
+        for conn_idx in conn_indices:
+            # Prune connections using internal connection_probability function
+            _connection_probability(
+                net.connectivity[conn_idx], probability=probability, conn_seed=seed_array[seed_count])
+            net.connectivity[conn_idx]['probability'] = probability
+            seed_count = seed_count + 1
+
+    # Add Poisson drives
+    weights_ampa_d1 = {'L2_pyramidal': 0.001, 'L5_pyramidal': 0.001, 'L2_basket': 0.0}
+    rates_d1 = {'L2_pyramidal': 10, 'L5_pyramidal': 10, 'L2_basket': 10}
+
+    net.add_poisson_drive(
+        name='distal', tstart=0, tstop=None, rate_constant=rates_d1, location='distal', n_drive_cells='n_cells',
+        cell_specific=True, weights_ampa=weights_ampa_d1, weights_nmda=None, space_constant=100.0,
+        synaptic_delays=0.1, probability=0.7, event_seed=seed_array[-1], conn_seed=seed_array[-2])
+
+    weights_ampa_p1 = {'L2_pyramidal': 0.001, 'L5_pyramidal': 0.001, 'L2_basket': 0.0, 'L5_basket': 0.0}
+    rates_p1 = {'L2_pyramidal': 10, 'L5_pyramidal': 10, 'L2_basket': 10, 'L5_basket': 10}
+
+    net.add_poisson_drive(
+        name='proximal', tstart=0, tstop=None, rate_constant=rates_p1, location='proximal', n_drive_cells='n_cells',
+        cell_specific=True, weights_ampa=weights_ampa_p1, weights_nmda=None, space_constant=100.0,
+        synaptic_delays=0.1, probability=1.0, event_seed=seed_array[-3], conn_seed=seed_array[-4])
+    
+def hnn_noise_conn_gscale_param_function(net, theta_dict):
+    conn_type_list = {'EI_connections': 'EI_gscale', 'EE_connections': 'EE_gscale', 
+                      'II_connections': 'II_gscale', 'IE_connections': 'IE_gscale'}
+    
+    seed_rng = np.random.default_rng(theta_dict['theta_extra']['sample_idx'])
+    seed_array = seed_rng.integers(10e5, size=100)
+
+    
+    seed_count = 0
+    for conn_type_name, conn_scale_name in conn_type_list.items():
+        conn_indices = theta_dict['theta_extra'][conn_type_name]
+        gscale = theta_dict[conn_scale_name]
+        for conn_idx in conn_indices:
+            # Scale weight by gscale
+            net.connectivity[conn_idx]['nc_dict']['A_weight'] *= gscale
+            seed_count = seed_count + 1
+
+    # Add Poisson drives
+    weights_ampa_d1 = {'L2_pyramidal': 0.001, 'L5_pyramidal': 0.001, 'L2_basket': 0.0}
+    rates_d1 = {'L2_pyramidal': 10, 'L5_pyramidal': 10, 'L2_basket': 10}
+
+    net.add_poisson_drive(
+        name='distal', tstart=0, tstop=None, rate_constant=rates_d1, location='distal', n_drive_cells='n_cells',
+        cell_specific=True, weights_ampa=weights_ampa_d1, weights_nmda=None, space_constant=100.0,
+        synaptic_delays=0.1, probability=0.7, event_seed=seed_array[-1], conn_seed=seed_array[-2])
+
+    weights_ampa_p1 = {'L2_pyramidal': 0.001, 'L5_pyramidal': 0.001, 'L2_basket': 0.0, 'L5_basket': 0.0}
+    rates_p1 = {'L2_pyramidal': 10, 'L5_pyramidal': 10, 'L2_basket': 10, 'L5_basket': 10}
+
+    net.add_poisson_drive(
+        name='proximal', tstart=0, tstop=None, rate_constant=rates_p1, location='proximal', n_drive_cells='n_cells',
+        cell_specific=True, weights_ampa=weights_ampa_p1, weights_nmda=None, space_constant=100.0,
+        synaptic_delays=0.1, probability=1.0, event_seed=seed_array[-3], conn_seed=seed_array[-4])
+    
+  
+    
 def load_prerun_simulations(
     dpl_files, spike_times_files, spike_gids_files,
     theta_files, downsample=1, save_name=None, save_data=False):
@@ -655,6 +750,8 @@ def load_prerun_simulations(
     
     dpl_all = np.vstack(dpl_all)
     theta_all = np.vstack(theta_all)
+    spike_times_all = np.array(spike_times_all, dtype=object)
+    spike_gids_all = np.array(spike_gids_all, dtype=object)
     
     if save_data and isinstance(save_name, str):
         np.save(save_name + '_dpl_all.npy', dpl_all)
