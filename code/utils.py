@@ -87,8 +87,8 @@ def run_hnn_sim(net, param_function, prior_dict, theta_samples, tstop, save_path
     theta_name = f'{save_path}/sbi_sims/theta_{save_suffix}.npy'
     
     np.save(dpl_name, dpl_orig)
-    #np.save(spike_times_name, spike_times_orig)
-    #np.save(spike_gids_name, spike_gids_orig)
+    np.save(spike_times_name, spike_times_orig)
+    np.save(spike_gids_name, spike_gids_orig)
     np.save(theta_name, theta_orig)
 
     files = glob.glob(str(save_path) + '/temp/*')
@@ -265,7 +265,8 @@ def batch(simulator, seq, theta_samples, save_path, save_spikes=False):
         net_res = res[0][0]
         dpl_res = res[0][1]
         
-        dpl_list.append(dpl_res[0].copy().smooth(20).data['agg'])
+        # dpl_list.append(dpl_res[0].copy().smooth(20).data['agg'])
+        dpl_list.append(dpl_res[0].copy().data['agg'])
         spike_times_list.append(net_res.cell_response.spike_times[0])
         spike_gids_list.append(net_res.cell_response.spike_gids[0])
 
@@ -723,7 +724,52 @@ def hnn_noise_conn_gscale_param_function(net, theta_dict):
         cell_specific=True, weights_ampa=weights_ampa_p1, weights_nmda=None, space_constant=100.0,
         synaptic_delays=0.1, probability=1.0, event_seed=seed_array[-3], conn_seed=seed_array[-4])
     
-  
+def beta_tuning_param_function(net, theta_dict):
+    conn_type_list = {'EI_connections': 'EI', 'EE_connections': 'EE', 
+                      'II_connections': 'II', 'IE_connections': 'IE'}
+    
+    seed_rng = np.random.default_rng(theta_dict['theta_extra']['sample_idx'])
+    seed_array = seed_rng.integers(10e5, size=100)
+
+    seed_count = 0
+    for conn_type_name, conn_suffix in conn_type_list.items():
+        conn_prob_name = f'{conn_suffix}_prob'
+        conn_gscale_name = f'{conn_suffix}_gscale'
+        
+        conn_indices = theta_dict['theta_extra'][conn_type_name]
+        probability = theta_dict[conn_prob_name]
+        gscale = theta_dict[conn_gscale_name]
+        
+        for conn_idx in conn_indices:
+            # Prune connections using internal connection_probability function
+            _connection_probability(
+                net.connectivity[conn_idx], probability=probability, conn_seed=seed_array[seed_count])
+            net.connectivity[conn_idx]['probability'] = probability
+            net.connectivity[conn_idx]['nc_dict']['A_weight'] *= gscale
+            seed_count = seed_count + 1
+
+    for conn_idx in range(len(net.connectivity)):
+        net.connectivity[conn_idx]['nc_dict']['lamtha'] = theta_dict['theta_extra']['lamtha']          
+        
+    rate = 10
+    # Add Poisson drives
+    weights_ampa_d1 = {'L2_pyramidal': theta_dict['L2e_distal'], 'L5_pyramidal': theta_dict['L5e_distal'],
+                       'L2_basket': theta_dict['L2i_distal']}
+    rates_d1 = {'L2_pyramidal': rate, 'L5_pyramidal': rate, 'L2_basket': rate}
+
+    net.add_poisson_drive(
+        name='distal', tstart=0, tstop=None, rate_constant=rates_d1, location='distal', n_drive_cells='n_cells',
+        cell_specific=True, weights_ampa=weights_ampa_d1, weights_nmda=None, space_constant=1e50,
+        synaptic_delays=0.0, probability=1.0, event_seed=seed_array[-1], conn_seed=seed_array[-2])
+
+    weights_ampa_p1 = {'L2_pyramidal': theta_dict['L2e_proximal'], 'L5_pyramidal': theta_dict['L5e_proximal'],
+                       'L2_basket': theta_dict['L2i_proximal'], 'L5_basket': theta_dict['L5i_proximal']}
+    rates_p1 = {'L2_pyramidal': rate, 'L5_pyramidal': rate, 'L2_basket': rate, 'L5_basket': rate}
+
+    net.add_poisson_drive(
+        name='proximal', tstart=0, tstop=None, rate_constant=rates_p1, location='proximal', n_drive_cells='n_cells',
+        cell_specific=True, weights_ampa=weights_ampa_p1, weights_nmda=None, space_constant=1e50,
+        synaptic_delays=0.0, probability=1.0, event_seed=seed_array[-3], conn_seed=seed_array[-4])
     
 def load_prerun_simulations(
     dpl_files, spike_times_files, spike_gids_files,
