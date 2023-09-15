@@ -65,4 +65,4 @@ run_hnn_sim(net=net, param_function=beta_tuning_param_function, prior_dict=prior
             theta_samples=theta_samples, tstop=tstop, save_path=save_path, save_suffix=save_suffix,
             theta_extra=theta_extra)
 
-#os.system('scancel -u ntolley')
+os.system('scancel -u ntolley')

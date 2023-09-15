@@ -246,7 +246,7 @@ def validate_posterior(net, nval_sims, param_function, data_path):
                 theta_samples=theta_samples, tstop=tstop, save_path=data_path, save_suffix=save_suffix)
 
 # Create batch simulation function
-def batch(simulator, seq, theta_samples, save_path, save_spikes=False):
+def batch(simulator, seq, theta_samples, save_path, save_spikes=True):
     print(f'Sim Idx: {(seq[0], seq[-1])}')
     res_list = list()
     # Create lazy list of tasks    
