@@ -98,6 +98,9 @@ for flow_idx in range(num_prior_fits):
     
     relative_beta_mask = relative_beta > relative_beta_threshold
     
+    dpl_filter = dpl_filter[relative_beta_mask, :]
+    theta_filter = theta_filter[relative_beta_mask, :]
+    
     prior_filtered = PriorBetaFiltered(parameters=list(prior_dict.keys()))
     optimizer = optim.Adam(prior_filtered.flow.parameters())
 
@@ -111,4 +114,4 @@ for flow_idx in range(num_prior_fits):
     joblib.dump(state_dict, f'{save_path}/flows/prior_filtered_flow_{flow_idx}.pkl')
 
 
-# os.system('scancel -u ntolley')
+os.system('scancel -u ntolley')

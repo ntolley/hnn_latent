@@ -106,7 +106,7 @@ def start_cluster():
     """Reserve SLURM resources using Dask Distributed interface"""
      # Set up cluster and reserve resources
     cluster = SLURMCluster(
-        cores=32, processes=32, queue='compute', memory="256GB", walltime="5:00:00",
+        cores=32, processes=32, queue='compute', memory="256GB", walltime="10:00:00",
         job_extra_directives=['-A csd403', '--nodes=1'], log_directory=os.getcwd() + '/slurm_out')
 
     client = Client(cluster)
